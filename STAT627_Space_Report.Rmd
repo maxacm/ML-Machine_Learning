@@ -1,0 +1,696 @@
+---
+title: "STAT-627 Celestial Classification"
+author: "Max Calzada, Josiah Gottfried, Sanghyeob Ko, Domingo Salerno"
+date: '2022-12-09'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(tidyverse, readxl, XML, jsonlite, tidymodels, infer, reshape2, pwr, janitor, lubridate, skimr, car, vip, caret, MASS, ISLR, glmnet, randomForest, gbm, rpart, boot, broom, gridExtra, ROCR, reshape2, pls, nnet, deepnet, klaR, data.table, tm, SnowballC, wordcloud, leaps, tree, bootstrap, leaps, tree, class)
+```
+
+# Introduction
+
+For our project, our central question was "Which statistical model would most optimally classify whether a celestial body is a star, quasar, or galaxy."
+
+To answer this question we built the following models:
+
+- KNN
+  - KNN with PCA
+- LDA/QDA
+  - LDA/QDA with PCA
+- Logistic Regression
+  - Logistic Regression with PCA
+- Trees/Random Forests
+  - Trees/Random Forests with PCA
+
+## Data source
+
+The data consists of 100,000 observations of celestial objects by the SDSS (Sloan Digital Sky Survey). Every observation is described by 17 feature columns and 1 class column which identifies it to be either a star, galaxy or quasar.
+We dropped the columns irrelevant to the classification question, leaving us with six predictor variables. The variables "u", "r", "g", "i", and "z" measure the light reaching the telescope at different wavelengths. The "redshift" variable is the increase in wavelength due to the distance that the light travels.
+
+<https://www.kaggle.com/datasets/fedesoriano/stellar-classification-dataset-sdss17>
+
+# Load data
+
+```{r}
+Space_DF <- read.csv("star_classification.csv") # Upload data
+Space_DF <- Space_DF[, c("class", "u", "r", "g", "i", "z", "redshift")]
+
+# Cleaning
+Space_DF <- subset(Space_DF, u != -9999) # Remove point with NAs
+Space_DF$class <- as.factor(Space_DF$class) # Convert class to a factor
+
+# Display
+head(Space_DF)
+
+```
+
+```{r}
+# Create indicator variables for logistic regression
+Space_DF$galaxy <- ifelse(Space_DF$class == "GALAXY", 1, 0)
+Space_DF$star <- ifelse(Space_DF$class == "STAR", 1, 0)
+Space_DF$quasar <- ifelse(Space_DF$class == "QSO", 1, 0)
+```
+
+# Data exploration
+
+Here we visually explore the relationships between some of the predictors and the class variable.
+
+```{r}
+plot(redshift ~ g, data = Space_DF, col = class)
+legend("bottomright", legend = levels(Space_DF$class), col = 1:3, pch = 15)
+plot(u ~ z, data = Space_DF, col = class)
+legend("bottomright", legend = levels(Space_DF$class), col = 1:3, pch = 15)
+plot(r ~ i, data = Space_DF, col = class)
+legend("bottomright", legend = levels(Space_DF$class), col = 1:3, pch = 15)
+```
+
+The plots suggest that redshift is an important predictor of class. They show some potential multicollinearity, so we will also run a principle components analysis.\
+We also need to test normality assumptions for discriminant analysis.
+
+```{r}
+norm_plots <- function(variable){
+  
+  # Histogram with normal curve
+  hist(variable, freq = F, main = paste(deparse(substitute(variable))))
+  curve(dnorm(x, mean = mean(variable), sd = sd(variable)), add = TRUE, col = "blue")
+  
+  # Theoretical quantiles plot (with the first 5000 points to save computing power)
+  qqnorm(variable[1:5000], main = paste(deparse(substitute(variable))))
+  qqline(variable[1:5000])
+  
+}
+
+par(mfrow = c(1,2))
+norm_plots(Space_DF$u)
+norm_plots(Space_DF$r)
+norm_plots(Space_DF$g)
+norm_plots(Space_DF$i)
+norm_plots(Space_DF$z)
+norm_plots(Space_DF$redshift)
+```
+
+All variables look reasonably normal except redshift.
+
+```{r}
+# Since the data contain negative values, let's try signed square root
+signsqrt <- function(x){
+  sign(x) * abs(x)^(1/2)
+}
+
+# Transform redshift
+Space_DF$trans.redshift <- signsqrt(Space_DF$redshift)
+norm_plots(Space_DF$trans.redshift)
+```
+
+With the signed square root transformation, the data look closer to normal.
+
+# Split data into training and testing sets
+
+To test our results, we will use both validation set and 10-fold cross-validation.
+
+```{r}
+set.seed(1)
+n.S <- nrow(Space_DF) 
+Z.S <- sample(n.S, n.S*0.9) # We’ll split data at random 
+
+S.Train <- Space_DF[Z.S,] # training data
+S.Test <- Space_DF[-Z.S,] # testing data
+X.S.Train <- S.Train[, c("u", "r", "g", "i", "z", "trans.redshift")]
+X.S.Test <- S.Test[, c("u", "r", "g", "i", "z", "trans.redshift")]
+Y.S.Train <- Space_DF$class[Z.S]
+Y.S.Test <- Space_DF$class[-Z.S]
+```
+
+```{r}
+# Set up folds for 10-fold validation
+set.seed(1)
+fold <- sample(rep(1:10, 10000), n.S)
+```
+
+```{r}
+# Initialize matrix for cross validation results
+CV.results <- as.data.frame(matrix(nrow = 12, ncol = 2))
+rownames(CV.results) <- c("KNN", "LDA", "QDA", "Logistic", "Tree", "RF",
+                          "KNN.PC", "LDA.PC", "QDA.PC", "Logistic.PC", "Tree.PC", "RF.PC")
+colnames(CV.results) <- c("ValSet", "KFold")
+```
+
+# Calculate principal components
+
+We will try each of our models using the original data against models using the first three principal components. In addition to addressing multicollinearity issues, we hope that the principal components will allow us to cut the size of the data in half.
+
+```{r}
+X.pca <-  model.matrix(class ~ u + r + g + i + z + trans.redshift, data = Space_DF)[,-1]
+pc <-  prcomp(X.pca, scale = TRUE)
+summary(pc)
+pc_df <- cbind(pc$x, Space_DF[c("class", "galaxy", "star", "quasar")])
+head(pc_df)
+
+# Training set / Testing set of PC data
+n.PC <- length(pc_df$class)
+S.Train.PC <- pc_df[Z.S,]
+S.Test.PC <- pc_df[-Z.S,]
+X.S.Train.PC <- S.Train.PC[, c("PC1", "PC2", "PC3")]
+X.S.Test.PC <- S.Test.PC[, c("PC1", "PC2", "PC3")]
+```
+
+The first three principal components explain 98% of the variance.
+
+```{r}
+norm_plots(pc_df$PC1)
+norm_plots(pc_df$PC2)
+norm_plots(pc_df$PC3)
+```
+
+The principal components appear to follow normal distributions, satisfying the assumption for discriminant analysis.
+
+# Models
+
+## KNN
+
+
+```{r}
+set.seed(1)
+knn.S = knn(X.S.Train, X.S.Test, Y.S.Train, 3) # K = 3?
+table(Y.S.Test, knn.S)
+```
+
+```{r}
+mean(Y.S.Test == knn.S )
+```
+
+```{r}
+# Tuning
+class.rate = rep(0,10)
+
+set.seed(1)
+for (K in 1:10) {
+  knn.S = knn(X.S.Train, X.S.Test, Y.S.Train, K)
+  class.rate[K] = mean(Y.S.Test == knn.S)
+}
+
+class.rate
+```
+
+```{r}
+which.max(class.rate)
+CV.results["KNN", "ValSet"] <- max(class.rate)
+```
+
+```{r}
+plot(class.rate, type = "l", xlab = "K")
+```
+
+### KNN, with PCA
+
+```{r}
+class.rate <- NULL
+
+set.seed(1)
+for (K in 1:12) {
+  knn.S.pca = knn(X.S.Train.PC, X.S.Test.PC, Y.S.Train, K) 
+  class.rate[K] = mean(Y.S.Test == knn.S.pca)
+}
+
+class.rate
+```
+
+```{r}
+which.max(class.rate)
+CV.results["KNN.PC", "ValSet"] <- max(class.rate)
+```
+
+```{r}
+plot(class.rate, type = "l", xlab = "K")
+```
+
+The benefit of KNN is that this is a parameter less classification method. 
+It classifies data without assuming any distribution shapes about the data. 
+Given the large n of 100,000 and the small p of 6, the KNN model will have the benefit of being able to closely follow a non-linear boundary and not follow noise too closely. 
+Note however that as KNN reduces bias, it tends to incur variance. 
+
+## LDA/QDA
+1. Data Analysis 1 (LDA)
+1-1. Linear Discriminant Analysis (LDA)
+```{r}
+# library(MASS)
+LDA <- lda(class ~ u + g + r + i + z + trans.redshift, data = Space_DF) # The main command for LDA
+LDA
+# Prior probabilities of groups: These are sample proportions of the 3 groups, from our data
+# Group means: Multivariate group means are computed within each group
+# Coefficients of linear discriminants: These printed coefficients determine the Fisher's linear discriminants LD1, LD2. The first one is a linear function that achieves the maximal separation of our four groups. LD2 is a linear function, orthogonal to LD1, that achieves the maximal separation among all linear functions orthogonal to LD1, etc. These functions are linear combinations of our linear discriminant functions. Their derivation is based on Linear Algebra.
+# Here, LD1 captures 87.93% of differences between the groups, LD2 adds 12.07% to that.
+```
+
+1-2. LDA Cross-validation (CV: LOOCV)
+```{r}
+# Cross-validation
+# Option CV=TRUE is used for “leave one out” cross-validation; for each sampling unit, it gives its class assignment without the current observation. This is a method of estimating the testing classifications rate instead of the training rate.
+LDA.fit <- lda(class ~ u + g + r + i + z + trans.redshift, CV = TRUE, data = Space_DF)
+table(Space_DF$class, LDA.fit$class) # The main diagonal shows correctly classified counts.
+mean(Space_DF$class == LDA.fit$class) # 94.54%: Correct classification rate = proportion of correctly classified counts.
+```
+
+1-3. LDA Cross-validation (CV: Cross-validation, training:testing = 9:1)
+```{r}
+LDA.training <- lda(class ~ u + g + r + i + z + trans.redshift, data = S.Train) # Only used the training set
+LDA.pred <- predict(LDA.training, newdata = S.Test) # Prediction by using the testing set
+table(S.Test$class, LDA.pred$class) # The main diagonal shows correctly classified counts.
+CV.results["LDA", "ValSet"] <- mean(S.Test$class == LDA.pred$class) 
+CV.results["LDA", "ValSet"] # 94.35%: Correct classification rate = proportion of correctly classified counts.
+```
+
+1-4. LDA Cross-validation (CV: k-fold 10)
+```{r}
+pred_rate <- NULL
+for(i in 1:10){
+  train_kf <- Space_DF[fold != i,]
+  test_kf <- Space_DF[fold == i,]
+  lda_kf <- lda(class ~ u + g + r + i + z + trans.redshift, data = train_kf )
+  lda_kf_pred <- predict(lda_kf, test_kf)
+  pred_rate[i] <- mean(test_kf$class == lda_kf_pred$class)
+}
+CV.results["LDA", "KFold"] <- mean(pred_rate) 
+CV.results["LDA", "KFold"] # 94.53% for K-fold 10 validation of LDA
+```
+
+
+2. Data Analysis 2 QDA
+2-1. Quadratic Discriminant Analysis (QDA)
+```{r}
+QDA <- qda(class ~ u + g + r + i + z + trans.redshift, data = Space_DF) # The main command for QDA
+QDA
+# Difference between LDA and QDA: As for the assumption of QDA, the observation of each class is drawn from a normal distribution, and it is the same as LDA. But the assumption that each class has its own covariance matrix is different from LDA.
+```
+
+2-2. QDA Cross-validation (CV: LOOCV)
+```{r}
+# Quadratic Discriminant Analysis
+QDA.fit <- qda(class ~ u + g + r + i + z + trans.redshift, CV = TRUE, data = Space_DF)
+table(Space_DF$class, QDA.fit$class) # The main diagonal shows correctly classified counts.
+mean(Space_DF$class == QDA.fit$class)
+table(is.na(QDA.fit$class)) # There are 7 NAs in the result.
+(55788+17428+21555)/(55788+3146+509+1524+17428+4+29+9+21555) # 94.77%: Correct classification rate = proportion of correctly classified counts.
+```
+
+2-3. QDA Cross-validation (CV: Cross-validation, training:testing = 9:1)
+```{r}
+QDA.training <- qda(class ~ u + g + r + i + z + trans.redshift, data = S.Train) # Only used the training set
+QDA.pred <- predict(QDA.training, newdata = S.Test) # Prediction by using the testing set
+table(S.Test$class, QDA.pred$class) # The main diagonal shows correctly classified counts.
+CV.results["QDA", "ValSet"] <- mean(S.Test$class == QDA.pred$class) 
+CV.results["QDA", "ValSet"] # 94.91%: Correct classification rate = proportion of correctly classified counts.
+```
+
+2-4. QDA Cross-validation (CV: k-fold 10)
+```{r}
+pred_rate <- NULL
+for(i in 1:10){
+  train_kf <- Space_DF[fold != i,]
+  test_kf <- Space_DF[fold == i,]
+  qda_kf <- qda(class ~ u + g + r + i + z + trans.redshift, data = train_kf )
+  qda_kf_pred <- predict(qda_kf, test_kf)
+  pred_rate[i] <- mean(test_kf$class == qda_kf_pred$class)
+}
+CV.results["QDA", "KFold"] <- mean(pred_rate) 
+CV.results["QDA", "KFold"] # 94.77% for K-fold 10 validation of QDA
+```
+
+
+3. LDA & QDA with PC (PC1, PC2, PC3)
+3-1. LDA with PC
+```{r}
+LDA.PC <- lda(class ~ PC1 + PC2 + PC3, data = pc_df)
+LDA.PC 
+# LD1 captures 91.08% of differences between the groups, LD2 adds 8.92% to that. The result is better than before. Originally, LD1 captured 87.93% of differences between the groups, LD2 adds 12.07% to that.
+```
+
+3-2. LDA with PC Cross-validation (CV: LOOCV)
+```{r}
+LDA.fit.PC <- lda(class ~ PC1 + PC2 + PC3, CV = TRUE, data = pc_df)
+table(pc_df$class, LDA.fit.PC$class) 
+mean(pc_df$class == LDA.fit.PC$class) # 82.71%. It is quite lower than original 94.54%, correct classification rate. It seems that the change of redshift may be the reason of the difference.
+```
+
+3-3. LDA with PC Cross-validation (CV: Cross-validation, training:testing = 9:1)
+```{r}
+LDA.training.PC <- lda(class ~ PC1 + PC2 + PC3, data = S.Train.PC)
+LDA.pred.PC <- predict(LDA.training.PC, newdata = S.Test.PC)
+table(S.Test.PC$class, LDA.pred.PC$class)
+CV.results["LDA.PC", "ValSet"] <- mean(S.Test.PC$class == LDA.pred.PC$class) 
+CV.results["LDA.PC", "ValSet"] # 94.21%. It is almost the same as the original 94.35%, correct classification rate.
+```
+
+3-4. LDA with PC Cross-validation (CV: k-fold 10)
+```{r}
+pred_rate <- NULL
+for(i in 1:10){
+  train_kf <- pc_df[fold != i,]
+  test_kf <- pc_df[fold == i,]
+  lda_kf <- lda(class ~ PC1 + PC2 + PC3, data = train_kf )
+  lda_kf_pred <- predict(lda_kf, test_kf)
+  pred_rate[i] <- mean(test_kf$class == lda_kf_pred$class)
+}
+CV.results["LDA.PC", "KFold"] <- mean(pred_rate)
+CV.results["LDA.PC", "KFold"] # 94.77%, It is almost the same as the original 94.45% for K-fold 10 validation of LDA
+```
+
+3-5. QDA with PC
+```{r}
+QDA.PC <- qda(class ~ PC1 + PC2 + PC3, data = pc_df) 
+QDA.PC
+```
+
+3-6. QDA with PC Cross-validation (CV: LOOCV)
+```{r}
+QDA.fit.PC <- qda(class ~ PC1 + PC2 + PC3, CV = TRUE, data = pc_df)
+table(pc_df$class, QDA.fit.PC$class)
+mean(pc_df$class == QDA.fit.PC$class) # 95.08%. It is almost the same as the original 94.77%
+```
+
+3-7. QDA with PC Cross-validation (CV: Cross-validation, training:testing = 9:1)
+```{r}
+QDA.training.PC <- qda(class ~ PC1 + PC2 + PC3, data = S.Train.PC)
+QDA.pred.PC <- predict(QDA.training.PC, newdata = S.Test.PC)
+table(S.Test.PC$class, QDA.pred.PC$class)
+CV.results["QDA.PC", "ValSet"] <- mean(S.Test.PC$class == QDA.pred.PC$class) 
+CV.results["QDA.PC", "ValSet"] # 95.18%, it is almost the same as the original 94.91%.
+```
+
+3-8. QDA with PC Cross-validation (CV: k-fold 10)
+```{r}
+pred_rate <- NULL
+for(i in 1:10){
+  train_kf <- pc_df[fold != i,]
+  test_kf <- pc_df[fold == i,]
+  qda_kf <- qda(class ~ PC1 + PC2 + PC3, data = train_kf )
+  qda_kf_pred <- predict(qda_kf, test_kf)
+  pred_rate[i] <- mean(test_kf$class == qda_kf_pred$class)
+}
+CV.results["QDA.PC", "KFold"] <- mean(pred_rate) 
+CV.results["QDA.PC", "KFold"] # 95.08%. It is almost the same as the original 94.77%
+```
+
+As for LDA & QDA, the result of QDA by validation set method showed the best prediction rate, 94.91%. 
+For the assumption of Normal distribution for LDA & QDA, we used the signed root squared ‘trans.redshift’ variable instead of the original ‘redshift’ variable. 
+Specifically, after making the basic models and PCA (PC1,2,3) models for LDA & QDA, we implemented three cross-validation methods (LOOCV, validation set, K-fold). Among the prediction rates of the validation results, the performance of QDA was overall better than LDA’s. 
+We may conclude that each class has its own covariance matrix, not the identical one, because LDA assumes the covariance matrix is identical.
+
+
+## Logistic regression
+
+Since there are three classes, we will create a separate logistic model for each. Then our prediction will be the class that has the highest probability.
+
+### 1. Define individual logistic models
+```{r logistic models, warning = F}
+# Calculate individual logistic models for each celestial object
+galaxy.mod <- glm(galaxy ~ u + g + r + i + z + trans.redshift, data = Space_DF, family = binomial)
+star.mod <- glm(star ~ u + g + r + i + z + trans.redshift, data = Space_DF, family = binomial)
+quasar.mod <- glm(quasar ~ u + g + r + i + z + trans.redshift, data = Space_DF, family = binomial)
+
+summary(galaxy.mod)
+summary(star.mod)
+summary(quasar.mod)
+```
+
+### 2. Select best subset
+```{r best subset}
+# criteria
+library(leaps)
+criteria <- NULL
+for(Y in list(Space_DF$galaxy, Space_DF$star, Space_DF$quasar)){
+  subsets <- regsubsets(Y ~ u + g + r + i + z + redshift, data = Space_DF)
+  criteria <- rbind(criteria,
+                    -summary(subsets)$adjr2, # converted to negative so that best is minimum
+                    summary(subsets)$bic,
+                    abs(summary(subsets)$cp - 1:6)) # absolute difference so that best is minimum
+}
+criteria <- as.data.frame(criteria)
+rownames(criteria) <- c("-adjR2 (galaxy)", "BIC (galaxy)", "|Cp - p| (galaxy)",
+                        "-adjR2 (star)", "BIC (star)", "|Cp - p| (star)",
+                        "-adjR2 (quasar)", "BIC (quasar)", "|Cp - p| (quasar)")
+criteria$best <- apply(criteria, 1, which.min)
+criteria
+```
+
+```{r stepwise selection}
+# stepwise
+full <- galaxy.mod
+null <- glm(galaxy ~ 1, data = Space_DF, family = binomial)
+stats::step(null, scope = list(lower = null, upper = full), direction = "forward", trace = 0)
+stats::step(full, scope = list(lower = null, upper = full), direction = "backward", trace = 0)
+```
+All methods indicate that the best subset includes all predictors
+
+### 3. Cross-validation
+```{r function}
+cv.logistic <- function(train, test, predictors){
+  # This function trains a logistic model for each type of celestial object, then
+  # predicts the type of celestial object based on which one is most probable
+  
+  # Inputs
+    # train: A training data set
+    # test: A testing data set
+    # predictors: The names of predictors to include in the model
+  
+  # Outputs
+  
+  formula <- list(as.formula(paste("galaxy ~", paste(predictors, collapse = "+"))),
+                  as.formula(paste("star ~", paste(predictors, collapse = "+"))),
+                  as.formula(paste("quasar ~", paste(predictors, collapse = "+"))))
+  
+  mod <- list(galaxy = glm(formula[[1]], data = train, family = binomial),
+              star = glm(formula[[2]], data = train, family = binomial),
+              quasar = glm(formula[[3]], data = train, family = binomial))
+  
+  pred <- data.frame(GALAXY = predict(mod$galaxy, newdata = test, type = "response"),
+                     STAR = predict(mod$star, newdata = test, type = "response"),
+                     QSO = predict(mod$quasar, newdata = test, type = "response"))
+  
+  pred$class <- apply(pred, 1, function(x) names(which.max(x)))
+  
+  return(list(predictions = pred,
+              class.rate = mean(pred$class == test$class),
+              confusion.matrix = table(pred$class, test$class)))
+  
+}
+```
+
+```{r logistic VS, warning = F}
+# cross-validation
+predictors <- c("u", "g", "r", "i", "z", "trans.redshift")
+
+VS <- cv.logistic(S.Train, S.Test, predictors)
+CV.results["Logistic", "ValSet"] <- VS$class.rate
+VS$confusion.matrix
+```
+
+```{r logistic KFold, warning = F}
+# 10-fold
+class.rates <- NULL
+
+for(i in 1:10){
+  train <- Space_DF[fold != i,]
+  test <- Space_DF[fold == i,]
+  KF <- cv.logistic(train, test, predictors)
+  class.rates <- c(class.rates, KF$class.rate)
+}
+
+CV.results["Logistic", "KFold"] <- mean(class.rates)
+```
+
+### 4. Logistic regression with principle components
+```{r logistic PC VS, warning = F}
+# cross-validation
+predictors <- c("PC1", "PC2", "PC3")
+
+VS <- cv.logistic(S.Train.PC, S.Test.PC, predictors)
+CV.results["Logistic.PC", "ValSet"] <- VS$class.rate
+VS$confusion.matrix
+```
+
+```{r logistic PC KFold, warning = F}
+# 10-fold
+
+class.rates <- NULL
+
+for(i in 1:10){
+  train <- pc_df[fold != i,]
+  test <- pc_df[fold == i,]
+  KF <- cv.logistic(train, test, predictors)
+  class.rates <- c(class.rates, KF$class.rate)
+}
+
+CV.results["Logistic.PC", "KFold"] <- mean(class.rates)
+```
+
+### Understanding the results
+Logistic regression has a classification rate of about 95.6% - 95.7%, slightly less than KNN. Logistic regression with principal components was just as accurate as regular logistic regression, so for this model using principal components to reduce the data set size is advantageous.
+
+
+## Trees/Random Forests
+
+### Single Tree
+
+```{r VS pruned tree}
+# train model and plot
+tree <- tree(class ~ u + g + r + i + z + redshift, S.Train)
+y_hat <- predict(tree, newdata = S.Test, type = 'class')
+tree
+plot(tree, type = 'uniform'); text(tree)
+
+# show performance on testing data
+CV.results["Tree", "ValSet"] <- mean(y_hat == Y.S.Test)
+table(y_hat, Y.S.Test)
+```
+
+The single tree classifies celestial bodies based on two predictors: redshift and g, with the former being the dominant predictor in the tree. Redshift is the only predictor that is used to classify stars. Very low redshift values correspond to stars, and very high redshift values correspond to quasars (though this is done with varying degrees of confidence depending on the g value). The middle range of redshift values can be split to classify galaxies on the lower end, and on the higher end it classifies into either galaxies or quasars, with g differentiating between the two with a redshift greater than 0.673369. 
+
+The performance is quite good, with a prediction accuracy of 95.67%.
+
+```{r K-fold pruned tree}
+# train model and plot
+tree <- tree(class ~ u + g + r + i + z + redshift, Space_DF)
+tree.cv <- cv.tree(tree, FUN = prune.misclass)
+tree.cv.size <- tree.cv$size[which.min(tree.cv$dev)]
+tree.pruned <- prune.misclass(tree, best = tree.cv.size)
+tree.pruned
+plot(tree.pruned, type = 'uniform'); text(tree.pruned)
+
+# show performance of model
+tree.pruned.s <- summary(tree.pruned)
+CV.results["Tree", "KFold"] <- 1 - tree.pruned.s[[7]][1] / tree.pruned.s[[7]][2]
+```
+
+Model performance improves when applying K-Fold cross validation, with a prediction accuracy of approximately 95.9%. The same predictors are used.
+
+```{r VS pruned tree pca}
+# train model and plot
+tree <- tree(class ~ PC1 + PC2 + PC3, S.Train.PC)
+y_hat <- predict(tree, newdata = S.Test.PC, type = 'class')
+tree
+plot(tree, type = 'uniform'); text(tree)
+
+# show performance on testing data
+CV.results["Tree.PC", "ValSet"] <- mean(y_hat == Y.S.Test)
+table(y_hat, Y.S.Test)
+```
+
+The prediction accuracy declines sharply when introducing principal components to the single pruned tree, down to 91.68%.
+
+```{r K-fold pruned tree pca}
+# train model and plot
+tree <- tree(class ~ PC1 + PC2 + PC3, pc_df)
+tree.cv <- cv.tree(tree, FUN = prune.misclass)
+tree.cv.size <- tree.cv$size[which.min(tree.cv$dev)]
+tree.pruned <- prune.misclass(tree, best = tree.cv.size)
+tree.pruned
+plot(tree.pruned, type = 'uniform'); text(tree.pruned)
+
+# show performance of model
+tree.pruned.s <- summary(tree.pruned)
+CV.results["Tree.PC", "KFold"] <- 1 - tree.pruned.s[[6]][1] / tree.pruned.s[[6]][2]
+```
+
+Interestingly, K-Fold cross-validation continues to improve prediction accuracy. Prediction accuracy declines to approximately 92.08%.
+
+### Random Forests
+
+```{r VS random forest}
+# initialize error and tree number variables
+rf.err <- 0
+ntrees <- 0
+for(i in 1:5){
+  rf <- randomForest(class ~ u + g + r + i + z + redshift, 
+                     data = S.Train, mtry = i)
+  rf.ntrees <- which.min(rf$err.rate)
+  rf <- randomForest(class ~ u + g + r + i + z + redshift, 
+                     data = S.Train, mtry = i, ntree = rf.ntrees)
+  y_hat <- predict(rf, newdata = S.Test)
+  rf.err[i] <- mean(y_hat != Y.S.Test)
+  ntrees[i] <- rf.ntrees
+}
+
+plot(rf.err); lines(rf.err)
+
+rf.optimal <- randomForest(class ~ u + g + r + i + z + redshift, 
+                           data = S.Train,
+                           mtry = which.min(rf.err), 
+                           ntrees = ntrees[which.min(rf.err)]
+                           )
+y_hat <- predict(rf.optimal, newdata = S.Test, type = 'class')
+table(y_hat, Y.S.Test)
+CV.results["RF", "ValSet"] <- mean(y_hat == Y.S.Test)
+```
+
+The random forest method achieves the highest prediction accuracy of all tree-based models at 97.77%. 
+
+```{r VS random forest PCA}
+# initialize error and tree number variables
+rf.err <- 0
+ntrees <- 0
+for(i in 1:5){
+  rf <- randomForest(class ~ PC1 + PC2 + PC3, 
+                     data = S.Train.PC, mtry = i)
+  rf.ntrees <- which.min(rf$err.rate)
+  rf <- randomForest(class ~ PC1 + PC2 + PC3, 
+                     data = S.Train.PC, mtry = i, ntree = rf.ntrees)
+  y_hat <- predict(rf, newdata = S.Test)
+  rf.err[i] <- mean(y_hat != Y.S.Test)
+  ntrees[i] <- rf.ntrees
+}
+
+plot(rf.err); lines(rf.err)
+
+rf.optimal <- randomForest(class ~ PC1 + PC2 + PC3, 
+                           data = S.Train.PC,
+                           mtry = which.min(rf.err), 
+                           ntrees = ntrees[which.min(rf.err)]
+                           )
+y_hat <- predict(rf.optimal, newdata = S.Test, type = 'class')
+table(y_hat, Y.S.Test)
+CV.results["RF.PC", "ValSet"] <- mean(y_hat == Y.S.Test)
+```
+
+Remaining consistent with prior models, principal components in the random forest model decrease prediction accuracy to 95.68%.
+
+In summary, principal components reduce the prediction accuracy of the tree-based models. One of the reasons is likely that the trees eliminate the multicolinearity issue introduced by the highly correlated wavelength variables by including only one them in conjunction with the redshift variable. Thus, where elimination of multicolinearity is an advantage of principal components, this is redundant when considering decision trees.
+
+Furthermore, random forests are able to achieve a higher prediction accuracy by considering all wavelength variables. This is a significant advantage over a single tree, which only ever considers one wavelength. 
+
+# Results
+
+## Model comparison
+
+```{r}
+CV.err <- (1 - CV.results)[order(CV.results$ValSet, decreasing = T),]
+
+barplot(CV.err$ValSet, 
+        main = "Validation Set Error Rates by Model",
+        names.arg = rownames(CV.err)[1:12], 
+        ylim = c(0, 0.09), 
+        las = 2,
+        col = "dark blue")
+```
+
+The random forest without principal components is the best performing model by a full percentage point. KNN with principal components is the next best model. The advantage of using this model it only requires half of the data size.
+
+## Discussion and conclusion
+
+The model with the best prediction rate was the random forest model at 97.76% accuracy.
+
+We believe the random forest was the model that most accurately predicted the testing data as this model is the most flexible and as it is a composite of multiple random tress (it is a composite of multiple models). 
+The trees classify the data more accurately because they only use redshift and one wavelength variable, eliminating the multicollinearity that may be introduced by including the highly correlated wavelength variables.
+
+The final questions our group poses to astronomers and to astrostatisticians are as follow:
+
+1)Is our final model accurate enough for your purpose in classifying stars, quasars, and galaxies?
+2)Is a model that classifies stars, quasars, and galaxies useful or do you also need a model that classifies comets, planets, and blackholes as well as stars, quasars, and galaxies?
+3)What are the negative consequences of misclassification in the various contexts?
+4)How long will our final model be useful? Would this model be useful for one year, five years, or ten years?
+5)How does our final model compare to other models?
+
+The answers would vary on a case-by-case basis, depending on the needs and goals of the organization in question.
